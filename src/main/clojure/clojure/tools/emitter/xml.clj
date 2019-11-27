@@ -6,7 +6,7 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns clojure.tools.emitter.jvm
+(ns clojure.tools.emitter.xml
   (:refer-clojure :exclude [eval macroexpand-1 macroexpand load])
   (:require [clojure.tools.analyzer.jvm :as a]
             [clojure.tools.analyzer :refer [macroexpand-1 macroexpand]]
@@ -30,8 +30,19 @@
             [clojure.string :as s]
             [clojure.pprint :as pp]
             [clojure.tools.reader :as r]
-            [clojure.tools.reader.reader-types :as readers])
-  (:import (clojure.lang IFn DynamicClassLoader Atom)))
+            [clojure.tools.reader.reader-types :as readers]
+            [clojure.data.xml :as xml])
+  (:import [clojure.lang IFn DynamicClassLoader Atom]
+           [java.io ByteArrayInputStream PrintWriter Reader StringReader StringWriter]
+           [java.nio.file Files Paths StandardOpenOption]
+           [java.nio.charset Charset StandardCharsets]
+           [javax.xml.stream XMLInputFactory
+                             XMLStreamReader
+                             XMLStreamConstants]
+           [javax.xml.parsers DocumentBuilder DocumentBuilderFactory]
+           [javax.xml.transform.dom DOMSource]
+           [javax.xml.transform OutputKeys TransformerFactory]
+           [javax.xml.transform.stream StreamSource StreamResult]))
 
 (defn write-class
   "(λ ClassName → Bytecode) → Nil
@@ -48,22 +59,41 @@
       (.write w bytecode)))
   nil)
 
+(defn write-xml
+  "Writes the given xml to a file named by the ClassName and
+  *compile-path*. Requires that *compile-path* be set. Returns Nil."
+  [name xml]
+  {:pre [(bound? #'clojure.core/*compile-path*)]}
+  (let [opath (str *compile-path* "/" name ".xml")
+        file (io/file opath)]
+    (.mkdirs (io/file (.getParent file)))
+    (with-open [outfile (java.io.FileWriter. opath)]
+      (spit outfile xml)))
+      ;; (xml/emit xml outfile)))
+    ;; (with-open [w (java.io.FileOutputStream. path)]
+    ;;   (.write w bytecode)))
+  nil)
+
+(declare pprint-xml)
+
 (defn compile-and-load
-  ([class-ast]
-     (compile-and-load class-ast (clojure.lang.RT/makeClassLoader)))
-  ([{:keys [class-name] :as class-ast} class-loader]
-   (println "*COMPILE-FILES*: " *compile-files*)
-   (println "Class AST:")
-   (pp/pprint class-ast)
-     (let [bytecode (x/-compile class-ast)]
+  ;; ([class-ast]
+  ;;    (compile-and-load class-ast (clojure.lang.RT/makeClassLoader)))
+  ([{:keys [class-name] :as xml}] ;; class-loader]
+   (let [xml-str (pprint-xml xml)]
+  (println "compile-and-load:" xml-str)
+   ;; (let [;;bytecode (x/-compile class-ast)
+   ;;       xcode class-ast]
        (when (and (bound? #'clojure.core/*compile-files*)
                   *compile-files*)
-         (write-class class-name bytecode))
-       (.defineClass ^DynamicClassLoader class-loader class-name bytecode nil))))
-
+         (write-xml
+          ;;class-name
+          "test"
+          xml-str)))))
 
 (def passes (into (disj a/default-passes #'trim)
-                  #{#'collect-internal-methods
+                  #{}
+                  #_#{#'collect-internal-methods
 
                     #'ensure-tag
 
@@ -121,10 +151,13 @@
                analyze-opts  a/default-passes-opts
                compile-files (if (bound? #'clojure.core/*compile-files*)
                                *compile-files* false)
-               class-loader  (clojure.lang.RT/makeClassLoader)}
+               ;; class-loader  (clojure.lang.RT/makeClassLoader)
+               }
           :as options}]
-     {:pre [(instance? DynamicClassLoader class-loader)]}
-     (let [mform (binding [macroexpand-1 a/macroexpand-1]
+     ;;{:pre [(instance? DynamicClassLoader class-loader)]}
+   ;; if *expand-macros*...
+     ;; (let [mform (binding [macroexpand-1 a/macroexpand-1]
+     (let [mform (binding [macroexpand-1 a/macroexpand-0]
                    (macroexpand form (a/empty-env)))]
        (if (and (seq? mform) (= 'do (first mform)))
          (let [[statements ret] (loop [statements [] [e & exprs] (rest mform)]
@@ -136,11 +169,20 @@
            (eval ret options))
          (binding [a/run-passes    run-passes
                    *compile-files* compile-files]
-           (let [cs (-> (a/analyze `(^:once fn* [] ~mform) (a/empty-env) analyze-opts)
-                      (e/emit-classes (merge {:debug? debug?} emit-opts)))
-                 _ (print "emitted CS: " cs)
-                 ;; classes (mapv #(compile-and-load % class-loader) cs)
+           ;; :once marks fn as run-once only
+           ;;(let [clj-ast (a/analyze `(^:once fn* [] ~mform) (a/empty-env) analyze-opts)
+            (let [clj-ast (a/analyze mform (a/empty-env) analyze-opts)
+                 _ (println "CLJ AST: ")
+                 _ (pp/pprint clj-ast)
+                 cs (e/emit-xml clj-ast (merge {:debug? debug?} emit-opts))
+                 _ (println "JVM AST type: " (type cs))
+                 ;; classes (mapv #(compile-and-load %
+                 ;;                                  ;; class-loader
+                 ;;                                  )
+                 ;;               ;;clj-ast)
+                 ;;               cs)
                  ]
+              (compile-and-load cs)
              #_(print "CLASSES: " (last classes))
              #_((.newInstance ^Class (last classes)))))))))
 
@@ -204,3 +246,78 @@
                                     :compile-files compile-files})))
                (recur))))
          nil))))
+
+(xml/alias-uri 'jvm "http://clojure.org/tools/emitter/jvm")
+
+(defn pprint-xml
+  [& elts]
+  ;; (log/info "PPRINT-IMPL: " elts)
+  (let [s elts #_(if (or (= :html (first elts))
+                  (= :xml (first elts)))
+            (do ;(log/trace "FIRST ELT: " (first elts) " " (keyword? (first elts)))
+                (rest elts))
+            (if (keyword? (first elts))
+              (throw (Exception. "only :html and :xml supported"))
+              elts))
+        ;; fmt (if (keyword? (first elts)) (first elts) :html)
+        ;; void (reset! mode fmt)
+        ;; log (log/trace "mode: " @mode)
+        ;; always serialize to xml, deal with html issues in the transform
+        ml (if (string? s)
+             (throw (Exception. "xml pprint only works on miraj.co-dom.Element"))
+             (xml/emit-str elts)
+             #_(if (> (count s) 3)
+               (do ;;(println "pprint-impl FOREST")
+                   (let [s (serialize-raw :xml (element :CODOM_56477342333109 s))]
+                     (reset! mode fmt)
+                     s))
+               (let [s (serialize-raw :xml s)]
+                 ;; (reset! mode fmt)
+                 s)))
+        ;; _ (log/info "XML PPRINT SERIALIZED: " ml)
+        xmlSource (StreamSource.  (StringReader. ml))
+        xmlOutput (StreamResult.
+                   (let [sw (StringWriter.)]
+                     #_(if (.startsWith ml "<!doctype")
+                       (.write sw "<!doctype html>\n"))
+                     sw))
+        factory (TransformerFactory/newInstance)
+
+        ;; _ (log/debug (format "XSL-ID-X %s" xsl-identity-transform-html))
+        transformer #_(if (= :html @mode)
+                      (let [r (io/resource "miraj/co_dom/identity-html.xsl")
+                            xsl (slurp r)]
+                        ;; (StringReader. xsl-identity-transform-html))))
+                        (.newTransformer factory (StreamSource. (StringReader. xsl))))
+                      (let [r (io/resource "miraj/co_dom/identity-xml.xsl")
+                            xsl (slurp r)]
+                        ;;(log/trace "transforming with xsl-identity-transform-xml")
+                        (.newTransformer factory (StreamSource. (StringReader. xsl)))))
+        (let [;;r (io/resource "xsl/identity-xml.xsl")
+              xsl (slurp "xsl/identity-xml.xsl")]
+          ;;(log/trace "transforming with xsl-identity-transform-xml")
+          (.newTransformer factory (StreamSource. (StringReader. xsl))))]
+    (.setOutputProperty transformer OutputKeys/METHOD "xml")
+    (.setOutputProperty transformer OutputKeys/STANDALONE "yes")
+    (.setOutputProperty transformer OutputKeys/ENCODING "utf-8")
+    (.setOutputProperty transformer OutputKeys/INDENT "yes")
+    (.setOutputProperty transformer "{http://xml.apache.org/xslt}indent-amount", "4")
+    #_(if (.startsWith ml "<?xml")
+      (.setOutputProperty transformer OutputKeys/OMIT_XML_DECLARATION "no")
+      (.setOutputProperty transformer OutputKeys/OMIT_XML_DECLARATION "yes"))
+
+    (.transform transformer xmlSource xmlOutput)
+    (let[result #_(if (= :html fmt)
+                  (let [string-writer (.getWriter xmlOutput)
+                        s (.toString string-writer)
+                        ;; _ (prn "XML OUTPUT: " s)
+                        void (.flush string-writer)
+                        ]
+                    ;;(str/replace s regx "")
+                    s)
+                  (do (println "XML FOOBAR")
+                      (.toString (.getWriter xmlOutput))))
+         (do (println "XML FOOBAR")
+             (.toString (.getWriter xmlOutput)))]
+      ;; (prn "PPRINT OUTPUT: " result)
+      result)))
